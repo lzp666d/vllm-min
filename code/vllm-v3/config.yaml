@@ -1,0 +1,53 @@
+# ============================================================
+# vllm 统一配置文件（v3 — FA2 + CUDA Graph）
+# 命令行参数会覆盖此处的默认值
+#
+# 默认是「体验档」：eager 前向，启动快、稳定，适合首次跑通。
+# 追求吞吐时，把下面「性能档」两处开关打开（或加 --cg --compile）。
+# ============================================================
+
+# --- 模型 ---
+model: "Qwen3-0.6B"
+
+# --- 推理参数 ---
+prompt: "Hello, my name is"
+max_new_tokens: 200
+temperature: 0.9
+top_p: 0.95
+top_k: 20
+
+# --- 引擎 ---
+enforce_eager: true   # true=eager（体验档默认）；false=启用 Decode CUDA Graph（性能档）
+torch_compile: false  # true=prefill 首 chunk 走 torch.compile（性能档）；false=不编译
+compile_mode: "reduce-overhead"  # default / reduce-overhead / max-autotune
+compile_dynamic: true   # true=符号形状（一次编译覆盖任意长度，在线服务推荐）；false=固定形状重放（新长度会重编译）
+dtype: "auto"           # 显式填 float16 / bfloat16 可覆盖；auto 通常落到 float16
+context_len: 4096
+
+# --- 调度器 ---
+max_num_seqs: 256
+max_num_batched_tokens: 8192
+mix_prefill_decode: true
+
+# --- chunked prefill（参数语义对齐 vLLM SchedulerConfig）---
+# max_prefill_chunk: 单个 prefill chunk 的 token 上限（vLLM: long_prefill_token_threshold）
+#   0    = 不主动切分，chunk 只受 max_num_batched_tokens 约束（v3 原行为）
+#   1024 = 主动切片：按 context_len/4 取（4096/4），且是 kvcache_block_size(256) 的整数倍（页对齐）
+#   效果：长 prompt 跨多步算完，decode 每步都能插进来，ITL 更平稳
+max_prefill_chunk: 1024
+# 每步最多允许几个"未完成"prefill（vLLM: max_num_partial_prefills）
+max_num_partial_prefills: 1
+# 其中"长请求"（prompt > max_prefill_chunk）的未完成 prefill 上限（vLLM: max_long_partial_prefills）
+max_long_partial_prefills: 1
+
+# Sarathi 式"每步 prefill 总配额"：限制整步的 prefill 工作量（而非单个请求）。
+#   0    = 关闭（vLLM 模式：每请求 cap + 半截数量上限；步长无显式上界）
+#   2048 = 一步最多往 prefill 花 2048 token，并按"公平份额"分给本步的多个请求
+#          → 步长上界 = decode 数 + 2048（ITL 可控），且一步可推进多个长请求
+max_prefill_tokens_per_step: 2048
+
+# --- KV Cache ---
+kvcache_block_size: 256  # FA2 paged 要求 256 的倍数
+prefix_backend: "hash"   # none / hash / radix
+gpu_memory_utilization: 0.85  # 开 CG+compile 时可调低至 0.8，避免小显存 OOM
+num_kvcache_blocks: 0    # 0=自动计算

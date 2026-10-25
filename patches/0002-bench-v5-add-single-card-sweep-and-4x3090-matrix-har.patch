@@ -1,0 +1,748 @@
+From 48f72133d348d8640473dafbe84632a3e25a984e Mon Sep 17 00:00:00 2001
+From: lzp666d <lzp666d@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 15:07:39 +0800
+Subject: [PATCH 2/4] bench(v5): add single-card sweep and 4x3090 matrix
+ harness
+
+---
+ vllm-v5/bench/README.md            |  88 +++++++++++----
+ vllm-v5/bench/moe_e2e.py           |  53 ++++++++-
+ vllm-v5/bench/run_4090_matrix.sh   |  70 ++++++++++++
+ vllm-v5/bench/single_card_sweep.py | 133 ++++++++++++++++++++++
+ vllm-v5/bench/vs_vllm.py           | 172 ++++++++++++++++++++---------
+ 5 files changed, 438 insertions(+), 78 deletions(-)
+ create mode 100644 vllm-v5/bench/run_4090_matrix.sh
+ create mode 100644 vllm-v5/bench/single_card_sweep.py
+
+diff --git a/vllm-v5/bench/README.md b/vllm-v5/bench/README.md
+index b19fd01..1744fca 100644
+--- a/vllm-v5/bench/README.md
++++ b/vllm-v5/bench/README.md
+@@ -1,31 +1,73 @@
+-"""Bench vs official vLLM + MoE e2e latency.
++# bench — 本引擎延迟/吞吐 与 官方 vLLM 对比
+ 
+-Install official vLLM in a **separate** env (do not mix into this project's
+-Torch/FlashInfer stack)::
++三个脚本 + 一个总编排：
+ 
+-    # example
+-    uv venv ~/venvs/vllm-official
+-    uv pip install vllm --python ~/venvs/vllm-official/bin/python
++| 脚本 | 作用 |
++|---|---|
++| `moe_e2e.py` | 本引擎单点：TTFT / TPOT / decode tok/s / e2e tok/s，`--json` 便于汇总 |
++| `single_card_sweep.py` | 单卡扫 eager / cg / cg+compile，出「**vs eager ×**」加速比表 |
++| `vs_vllm.py` | 与官方 vLLM 同负载对比（含并发吞吐 `throughput_tok_s` 与 TPOT） |
++| `run_4090_matrix.sh` | 4×4090 一键：正确性 + 单卡 sweep + vs vLLM |
+ 
+-Then::
++---
+ 
+-    export CUDA_DEVICE_ORDER=PCI_BUS_ID
+-    # our engine
+-    PYTHONPATH=. python bench/moe_e2e.py --devices 1
+-    # compare (uses VLLM_BIN or python -c import vllm)
+-    PYTHONPATH=. python bench/vs_vllm.py --model dense --devices 1 \\
+-        --vllm-python ~/venvs/vllm-official/bin/python
+-    PYTHONPATH=. python bench/vs_vllm.py --model moe --devices 1 \\
+-        --vllm-python ~/venvs/vllm-official/bin/python
++## 装官方 vLLM（**独立** venv，别混进本项目的 Torch/FlashInfer 栈）
+ 
+-Metrics (both engines, same prompt / max_tokens / greedy)::
++```bash
++uv venv ~/venvs/vllm-official
++uv pip install vllm --python ~/venvs/vllm-official/bin/python
++```
+ 
+-    ttft_ms, decode_tok_s, e2e_tok_s, tokens (for correctness spot-check)
++AutoDL 上本仓库现成的等价环境是 `/root/autodl-tmp/venvs/vllm`（vLLM 0.26.0），
++可直接把它当 `--vllm-python`。
+ 
+-MoE matrix (TP / EP / CUDA Graph)::
++---
+ 
+-    bash bench/run_moe_matrix.sh
+-    # or single cell:
+-    PYTHONPATH=. python bench/moe_e2e.py --devices 0 --tp 1 --cg --moe-backend triton
+-    PYTHONPATH=. python bench/moe_e2e.py --devices 0,1 --tp 2 --ep --eager
+-"""
++## 跑法
++
++```bash
++cd vllm-v5
++export CUDA_DEVICE_ORDER=PCI_BUS_ID PYTHONPATH=.
++
++# 1) 本引擎单点
++python bench/moe_e2e.py --model dense --devices 0 --cg
++python bench/moe_e2e.py --model moe --devices 0,1 --tp 2 --ep --eager
++
++# 2) 单卡档位 sweep（Qwen3-0.6B）：tok/s 与 vs eager 加速比
++python bench/single_card_sweep.py --device 0
++
++# 3) 与官方 vLLM 对比
++#    单请求
++python bench/vs_vllm.py --model dense --devices 0 \
++    --vllm-python /root/autodl-tmp/venvs/vllm/bin/python
++#    4 卡 TP=4 + 8 并发（吞吐）
++python bench/vs_vllm.py --model dense --devices 0,1,2,3 --tp 4 --concurrency 8 \
++    --vllm-python /root/autodl-tmp/venvs/vllm/bin/python
++#    MoE TP=2 + EP
++python bench/vs_vllm.py --model moe --devices 0,1 --tp 2 --ep \
++    --vllm-python /root/autodl-tmp/venvs/vllm/bin/python
++
++# 4) 一把梭
++PY=python \
++VLLM_PY=/root/autodl-tmp/venvs/vllm/bin/python \
++bash bench/run_4090_matrix.sh
++```
++
++---
++
++## 指标口径
++
++两个引擎都用同一组 prompt / `max_tokens` / greedy / `ignore_eos`：
++
++```
++ttft_ms            首 token 延迟（平均）
++tpot_ms            每输出 token 时间 = (e2e - ttft) / (n - 1)
++decode_tok_s       单请求 decode 速度 = (n - 1) / (e2e - ttft)
++throughput_tok_s   并发批总吞吐 = 批内总输出 token / 墙钟
++tokens             逐 token 输出（正确性 spot-check）
++```
++
++> 注：官方 `LLM.generate` 不暴露流式首 token，TTFT 用同批 `max_tokens=1` 的墙钟近似；
++> 本引擎是真实首 token 时间。对比时留意这个口径差异（vLLM 侧 TTFT 偏保守）。
++
++MoE 矩阵（TP / EP / CUDA Graph）另有 `run_moe_matrix.sh`。
+diff --git a/vllm-v5/bench/moe_e2e.py b/vllm-v5/bench/moe_e2e.py
+index 0c8be9c..0fc4e01 100644
+--- a/vllm-v5/bench/moe_e2e.py
++++ b/vllm-v5/bench/moe_e2e.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import json
+ import statistics
+ import sys
+ import time
+@@ -39,8 +40,10 @@ def _measure(eng: Engine, prompt: str, *, n: int, warmup: int, reps: int) -> dic
+     e2e = statistics.mean(e2es)
+     ttft = statistics.mean(ttfts)
+     decode_s = max(e2e - ttft / 1e3, 1e-6)
++    tpot_ms = (e2e - ttft / 1e3) / max(n - 1, 1) * 1e3
+     return {
+         "ttft_ms": ttft,
++        "tpot_ms": tpot_ms,
+         "e2e_s": e2e,
+         "e2e_tok_s": n / e2e,
+         "decode_tok_s": (n - 1) / decode_s,
+@@ -60,6 +63,23 @@ def main() -> None:
+     p.add_argument("--prompt", default="The capital of France is")
+     p.add_argument("--moe-backend", default="triton")
+     p.add_argument("--nccl-port", type=int, default=29500)
++    cc = p.add_mutually_exclusive_group()
++    cc.add_argument(
++        "--compile",
++        action="store_true",
++        help="enable prefill torch.compile (torch_compile=True)",
++    )
++    cc.add_argument(
++        "--no-compile",
++        action="store_true",
++        help="force prefill torch.compile off (default)",
++    )
++    p.add_argument(
++        "--compile-mode",
++        default="reduce-overhead",
++        choices=("default", "reduce-overhead", "max-autotune"),
++    )
++    p.add_argument("--json", action="store_true", help="print one JSON line")
+     cg = p.add_mutually_exclusive_group()
+     cg.add_argument(
+         "--cg",
+@@ -87,6 +107,9 @@ def main() -> None:
+             tp_size=args.tp,
+             enable_ep=bool(args.ep),
+             enforce_eager=not use_cg,
++            torch_compile=bool(args.compile) and not bool(args.no_compile),
++            compile_mode=args.compile_mode,
++            compile_dynamic=True,
+             max_num_seqs=1,
+             context_len=2048,
+             num_kvcache_blocks=64,
+@@ -101,12 +124,36 @@ def main() -> None:
+     finally:
+         eng.destroy()
+ 
+-    mode = "cg" if use_cg else "eager"
++    if args.compile and use_cg:
++        mode = "cg+compile"
++    elif args.compile:
++        mode = "compile"
++    elif use_cg:
++        mode = "cg"
++    else:
++        mode = "eager"
++    if args.json:
++        print(
++            json.dumps(
++                {
++                    "model": args.model,
++                    "tp": args.tp,
++                    "ep": bool(args.ep),
++                    "mode": mode,
++                    "devices": devices,
++                    "n": args.n,
++                    "moe_backend": args.moe_backend,
++                    **r,
++                },
++                ensure_ascii=False,
++            )
++        )
++        return
+     print(
+         f"model={args.model} tp={args.tp} ep={args.ep} mode={mode} "
+         f"devices={devices} n={args.n}\n"
+-        f"  ttft_ms={r['ttft_ms']:.2f}  decode_tok/s={r['decode_tok_s']:.2f}  "
+-        f"e2e_tok/s={r['e2e_tok_s']:.2f}\n"
++        f"  ttft_ms={r['ttft_ms']:.2f}  tpot_ms={r['tpot_ms']:.3f}  "
++        f"decode_tok/s={r['decode_tok_s']:.2f}  e2e_tok/s={r['e2e_tok_s']:.2f}\n"
+         f"  tokens={r['tokens'][:16]}{'...' if len(r['tokens']) > 16 else ''}"
+     )
+ 
+diff --git a/vllm-v5/bench/run_4090_matrix.sh b/vllm-v5/bench/run_4090_matrix.sh
+new file mode 100644
+index 0000000..b3a08b7
+--- /dev/null
++++ b/vllm-v5/bench/run_4090_matrix.sh
+@@ -0,0 +1,70 @@
++#!/usr/bin/env bash
++# 4x RTX 4090 一键复现：并行正确性 + 单卡档位 sweep + 与官方 vLLM 对比。
++#
++# 用法:
++#   cd vllm-v5
++#   bash bench/run_4090_matrix.sh
++#
++# 可覆盖的环境变量:
++#   PY       本项目解释器（默认 python，建议 python）
++#   VLLM_PY  装了官方 vLLM 的解释器（默认空 → 跳过对比，建议 venvs/vllm/bin/python）
++#   OUT      日志路径（默认 /tmp/vllmmin_4090_<时间戳>.log）
++#   N        每次请求输出 token 数（默认 64）
++#   CONC     并发数（默认 8）
++#
++# 例:
++#   PY=python \
++#   VLLM_PY=/root/autodl-tmp/venvs/vllm/bin/python \
++#   bash bench/run_4090_matrix.sh
++set -uo pipefail
++cd "$(dirname "$0")/.."
++
++PY="${PY:-python}"
++VLLM_PY="${VLLM_PY:-}"
++OUT="${OUT:-/tmp/vllmmin_4090_$(date +%Y%m%d_%H%M%S).log}"
++N="${N:-64}"
++CONC="${CONC:-8}"
++export CUDA_DEVICE_ORDER=PCI_BUS_ID
++export PYTHONPATH=.
++
++run() { echo; echo "===== $* ====="; "$@" 2>&1 | tee -a "$OUT"; }
++
++: >"$OUT"
++echo "interpreter : $PY" | tee -a "$OUT"
++echo "vllm python : ${VLLM_PY:-<unset>}" | tee -a "$OUT"
++echo "log         : $OUT" | tee -a "$OUT"
++
++# --- 0. 环境自检 ---
++run "$PY" -c "import torch, triton, flash_attn, flashinfer; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count(), 'gpus')"
++
++# --- 1. 正确性 ---
++# unit 无 GPU 也能过；gpu / distributed 需要卡。
++run "$PY" -m pytest tests/unit -q
++run "$PY" -m pytest tests/gpu -q --tb=short -m 'not slow'
++# fp32 golden：tp=2 / pp=2 逐 token 一致（需 >=2 张同型号卡）
++run "$PY" -m pytest tests/distributed/test_dense_parallel.py -q --tb=short
++# MoE tp=2 / tp2+ep 与 tp=1 一致（需 Qwen1.5-MoE-A2.7B）
++run "$PY" -m pytest tests/distributed/test_moe_parallel.py -q --tb=short
++
++# --- 2. 单卡 4090: Qwen3-0.6B  eager / cg / cg+compile ---
++# 逐张卡各扫一遍，方便挑空闲卡，也便于看卡间波动。
++for d in 0 1 2 3; do
++  run "$PY" bench/single_card_sweep.py --device "$d" --model dense --n "$N"
++done
++
++# --- 3. 与官方 vLLM 对比: TP=1 / TP=4，单并发 + 并发批 ---
++if [[ -n "$VLLM_PY" ]]; then
++  for c in 1 "$CONC"; do
++    run "$PY" bench/vs_vllm.py --model dense --devices 0 --tp 1 \
++        --concurrency "$c" --n "$N" --vllm-python "$VLLM_PY"
++    run "$PY" bench/vs_vllm.py --model dense --devices 0,1,2,3 --tp 4 \
++        --concurrency "$c" --n "$N" --vllm-python "$VLLM_PY"
++  done
++  # MoE（Qwen1.5-MoE-A2.7B）TP=2 + EP
++  run "$PY" bench/vs_vllm.py --model moe --devices 0,1 --tp 2 --ep \
++      --n "$N" --vllm-python "$VLLM_PY"
++else
++  echo "[skip] 官方 vLLM 对比：设 VLLM_PY=<venv>/bin/python 后重跑" | tee -a "$OUT"
++fi
++
++echo; echo "done -> $OUT" | tee -a "$OUT"
+diff --git a/vllm-v5/bench/single_card_sweep.py b/vllm-v5/bench/single_card_sweep.py
+new file mode 100644
+index 0000000..4cd215e
+--- /dev/null
++++ b/vllm-v5/bench/single_card_sweep.py
+@@ -0,0 +1,133 @@
++"""Single-GPU sweep: eager vs Decode CUDA Graph vs CG+prefill compile.
++
++每档在**独立子进程**里跑 ``bench/moe_e2e.py --json``（避免 CUDA Graph / compile
++状态互相污染），最后汇总成 Markdown 表。单卡 Qwen3-0.6B 的
++``e2e tok/s`` 与 ``vs eager`` 一列，就是简历里「×× tok/s、较 Eager 提升 ×」的口径。
++
++用法（在 vllm-v5/ 下）::
++
++    export CUDA_DEVICE_ORDER=PCI_BUS_ID PYTHONPATH=.
++    python bench/single_card_sweep.py --device 0                 # Qwen3-0.6B
++    python bench/single_card_sweep.py --device 1 --model moe     # MoE 档位
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++CELLS: tuple[tuple[str, list[str]], ...] = (
++    ("eager", ["--eager"]),
++    ("cg", ["--cg"]),
++    ("cg+compile", ["--cg", "--compile"]),
++)
++
++
++def _run_cell(
++    *,
++    device: int,
++    cell_args: list[str],
++    model: str,
++    n: int,
++    warmup: int,
++    reps: int,
++    backend: str,
++) -> dict:
++    env = os.environ.copy()
++    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
++    env["CUDA_VISIBLE_DEVICES"] = str(device)
++    root = str(ROOT)
++    env["PYTHONPATH"] = root + (
++        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
++    )
++    cmd = [
++        sys.executable,
++        "bench/moe_e2e.py",
++        "--model",
++        model,
++        "--devices",
++        "0",
++        "--n",
++        str(n),
++        "--warmup",
++        str(warmup),
++        "--reps",
++        str(reps),
++        "--moe-backend",
++        backend,
++        "--json",
++        *cell_args,
++    ]
++    proc = subprocess.run(
++        cmd, cwd=root, env=env, capture_output=True, text=True, timeout=7200
++    )
++    if proc.returncode != 0:
++        raise RuntimeError(
++            f"cell {cell_args} failed (device={device})\n"
++            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
++        )
++    lines = [ln for ln in proc.stdout.splitlines() if ln.strip().startswith("{")]
++    if not lines:
++        raise RuntimeError(f"no JSON from cell {cell_args}\n{proc.stdout}")
++    return json.loads(lines[-1])
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--device", type=int, default=0, help="物理 GPU 号（可用 nvidia-smi 查）")
++    ap.add_argument("--model", choices=("dense", "moe"), default="dense")
++    ap.add_argument("--n", type=int, default=64)
++    ap.add_argument("--warmup", type=int, default=2)
++    ap.add_argument("--reps", type=int, default=3)
++    ap.add_argument("--moe-backend", default="triton")
++    ap.add_argument("--json", action="store_true")
++    args = ap.parse_args()
++
++    rows: list[tuple[str, dict]] = []
++    for label, extra in CELLS:
++        r = _run_cell(
++            device=args.device,
++            cell_args=extra,
++            model=args.model,
++            n=args.n,
++            warmup=args.warmup,
++            reps=args.reps,
++            backend=args.moe_backend,
++        )
++        rows.append((label, r))
++        print(f"[ok] {label}: {r['e2e_tok_s']:.1f} tok/s", flush=True)
++
++    base = rows[0][1]
++    if args.json:
++        print(
++            json.dumps(
++                {
++                    "model": args.model,
++                    "device": args.device,
++                    "n": args.n,
++                    "cells": {label: r for label, r in rows},
++                },
++                ensure_ascii=False,
++            )
++        )
++        return
++
++    print(f"\n# 单卡 sweep — model={args.model} device={args.device} n={args.n}\n")
++    print("| 档位 | e2e tok/s | decode tok/s | TTFT ms | TPOT ms | vs eager |")
++    print("|---|---:|---:|---:|---:|---:|")
++    for label, r in rows:
++        speed = r["e2e_tok_s"] / base["e2e_tok_s"] if base["e2e_tok_s"] else float("nan")
++        print(
++            f"| {label} | {r['e2e_tok_s']:.1f} | {r['decode_tok_s']:.1f} | "
++            f"{r['ttft_ms']:.2f} | {r['tpot_ms']:.3f} | {speed:.2f}x |"
++        )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/vllm-v5/bench/vs_vllm.py b/vllm-v5/bench/vs_vllm.py
+index 41a5dac..6189544 100644
+--- a/vllm-v5/bench/vs_vllm.py
++++ b/vllm-v5/bench/vs_vllm.py
+@@ -2,12 +2,23 @@
+ 
+ Official vLLM is loaded via a **separate** interpreter (``--vllm-python``) so it
+ does not fight this repo's Torch / FlashInfer stack.
++
++Metrics (both engines use the same prompts / max_tokens / greedy + ignore_eos):
++
++    ttft_ms           首 token 延迟（平均）
++    tpot_ms           每输出 token 时间 = (e2e - ttft) / (n - 1)
++    decode_tok_s      单请求 decode 速度 = 1000 / tpot_ms
++    throughput_tok_s  并发批的总吞吐 = 批内总输出 token / 墙钟
++    tokens            逐 token 输出，用于正确性 spot-check
++
++``--concurrency C`` 会一次并发投递 C 条不同请求（C==1 即单请求基线）。
+ """
+ 
+ from __future__ import annotations
+ 
+ import argparse
+ import json
++import os
+ import statistics
+ import subprocess
+ import sys
+@@ -20,10 +31,22 @@ sys.path.insert(0, str(ROOT))
+ from src import Engine, EngineConfig, SamplingParams  # noqa: E402
+ from tests.helpers.paths import DENSE_MODEL, MOE_MODEL  # noqa: E402
+ 
++PROMPT_POOL = (
++    "The capital of France is",
++    "Hello, my name is",
++    "The quick brown fox jumps over",
++    "In machine learning, attention is",
++    "Write a short poem about the sea:",
++    "The best way to learn Python is",
++    "Once upon a time, there was a",
++    "Explain why the sky is blue:",
++)
++
+ _VLLM_WORKER = r"""
+-import json, sys, time, statistics
+-model, prompt, n, warmup, reps, tp, max_model_len = sys.argv[1:8]
++import json, statistics, sys, time
++model, prompts_json, n, warmup, reps, tp, max_model_len = sys.argv[1:8]
+ n, warmup, reps, tp, max_model_len = map(int, (n, warmup, reps, tp, max_model_len))
++prompts = json.loads(prompts_json)
+ from vllm import LLM, SamplingParams
+ llm = LLM(
+     model=model,
+@@ -33,41 +56,52 @@ llm = LLM(
+     disable_log_stats=True,
+     gpu_memory_utilization=0.85,
+ )
+-sp = SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True)
+ for _ in range(warmup):
+-    llm.generate([prompt], SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True))
+-e2es, ttfts, last = [], [], []
++    llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True))
++sp = SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True)
++e2es, last, total = [], [], 0
+ for _ in range(reps):
+     t0 = time.perf_counter()
+-    outs = llm.generate([prompt], sp)
+-    t1 = time.perf_counter()
+-    # vLLM LLM.generate is opaque for true TTFT; approximate with e2e for n=1 warmup check.
+-    e2es.append(t1 - t0)
+-    last = list(outs[0].outputs[0].token_ids)
+-# Approximate TTFT: run max_tokens=1
++    outs = llm.generate(prompts, sp)
++    e2es.append(time.perf_counter() - t0)
++    last = [list(o.outputs[0].token_ids) for o in outs]
++    total = sum(len(t) for t in last)
++e2e = statistics.mean(e2es)
++# TTFT：官方 LLM.generate 不暴露流式首 token，用同一批 max_tokens=1 的墙钟近似。
+ sp1 = SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True)
+ tt = []
+ for _ in range(reps):
+     t0 = time.perf_counter()
+-    llm.generate([prompt], sp1)
++    llm.generate(prompts, sp1)
+     tt.append((time.perf_counter() - t0) * 1e3)
+-e2e = statistics.mean(e2es)
+ ttft = statistics.mean(tt)
+ decode_s = max(e2e - ttft / 1e3, 1e-6)
+ print(json.dumps({
+     "engine": "vllm",
++    "concurrency": len(prompts),
+     "ttft_ms": ttft,
++    "tpot_ms": (e2e - ttft / 1e3) / max(n - 1, 1) * 1e3,
+     "e2e_s": e2e,
+-    "e2e_tok_s": n / e2e,
+-    "decode_tok_s": (n - 1) / decode_s if n > 1 else float("nan"),
++    "decode_tok_s": (n - 1) / decode_s,
++    "throughput_tok_s": total / e2e,
+     "tokens": last,
+ }))
+ """
+ 
+ 
++def _prompts(concurrency: int, num_prompts: int) -> list[str]:
++    out: list[str] = []
++    for i in range(num_prompts):
++        p = PROMPT_POOL[i % len(PROMPT_POOL)]
++        if i >= len(PROMPT_POOL):
++            p = f"{p} ({i})"
++        out.append(p)
++    return out
++
++
+ def _ours(
+     model: str,
+-    prompt: str,
++    prompts: list[str],
+     *,
+     n: int,
+     warmup: int,
+@@ -84,7 +118,7 @@ def _ours(
+             tp_size=tp,
+             enable_ep=enable_ep,
+             enforce_eager=True,
+-            max_num_seqs=1,
++            max_num_seqs=max(len(prompts), 1),
+             context_len=2048,
+             num_kvcache_blocks=64,
+             gpu_memory_utilization=0.85,
+@@ -95,32 +129,48 @@ def _ours(
+     try:
+         sp_w = SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True)
+         for _ in range(warmup):
+-            seq = eng.add_request(prompt, sp_w)
+-            while not seq.is_finished:
+-                eng.step()
+-        e2es, ttfts, last = [], [], []
++            for prompt in prompts:
++                seq = eng.add_request(prompt, sp_w)
++                while not seq.is_finished:
++                    eng.step()
++
+         sp = SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True)
++        walls: list[float] = []
++        ttfts: list[float] = []
++        tpots: list[float] = []
++        last: list[list[int]] = []
+         for _ in range(reps):
+-            seq = eng.add_request(prompt, sp)
++            seqs = [eng.add_request(prompt, sp) for prompt in prompts]
+             t0 = time.perf_counter()
+-            first = None
+-            while not seq.is_finished:
++            first: list[float | None] = [None] * len(seqs)
++            while any(not s.is_finished for s in seqs):
+                 eng.step()
+-                if first is None and seq.num_completion_tokens >= 1:
+-                    first = time.perf_counter()
++                now = time.perf_counter()
++                for i, seq in enumerate(seqs):
++                    if first[i] is None and seq.num_completion_tokens >= 1:
++                        first[i] = now
+             t1 = time.perf_counter()
+-            e2es.append(t1 - t0)
+-            ttfts.append((first - t0) * 1e3 if first else float("nan"))
+-            last = list(seq.token_ids[seq.num_prompt_tokens :])
+-        e2e = statistics.mean(e2es)
++            wall = t1 - t0
++            walls.append(wall)
++            for i, seq in enumerate(seqs):
++                f = first[i] if first[i] is not None else t1
++                ttfts.append((f - t0) * 1e3)
++                tpots.append((wall - (f - t0)) / max(n - 1, 1) * 1e3)
++            last = [list(seq.token_ids[seq.num_prompt_tokens :]) for seq in seqs]
++
++        e2e = statistics.mean(walls)
+         ttft = statistics.mean(ttfts)
++        tpot = statistics.mean(tpots)
+         decode_s = max(e2e - ttft / 1e3, 1e-6)
++        total_tokens = sum(len(t) for t in last)
+         return {
+             "engine": "v5",
++            "concurrency": len(prompts),
+             "ttft_ms": ttft,
++            "tpot_ms": tpot,
+             "e2e_s": e2e,
+-            "e2e_tok_s": n / e2e,
+             "decode_tok_s": (n - 1) / decode_s,
++            "throughput_tok_s": total_tokens / e2e,
+             "tokens": last,
+         }
+     finally:
+@@ -130,7 +180,7 @@ def _ours(
+ def _vllm(
+     python: str,
+     model: str,
+-    prompt: str,
++    prompts: list[str],
+     *,
+     n: int,
+     warmup: int,
+@@ -144,7 +194,7 @@ def _vllm(
+         "-c",
+         _VLLM_WORKER,
+         model,
+-        prompt,
++        json.dumps(prompts),
+         str(n),
+         str(warmup),
+         str(reps),
+@@ -170,16 +220,24 @@ def main() -> None:
+     p.add_argument("--devices", default="1")
+     p.add_argument("--tp", type=int, default=1)
+     p.add_argument("--ep", action="store_true", help="v5 only (official uses TP)")
++    p.add_argument("--concurrency", type=int, default=1, help="并发请求数（批量吞吐）")
++    p.add_argument(
++        "--num-prompts",
++        type=int,
++        default=0,
++        help="总请求数，默认等于 --concurrency",
++    )
+     p.add_argument("--n", type=int, default=64)
+     p.add_argument("--warmup", type=int, default=2)
+     p.add_argument("--reps", type=int, default=3)
+-    p.add_argument("--prompt", default="The capital of France is")
++    p.add_argument("--prompt", default="")
+     p.add_argument("--moe-backend", default="triton")
+     p.add_argument(
+         "--vllm-python",
+         default="",
+         help="Python with official `vllm` installed (separate venv recommended)",
+     )
++    p.add_argument("--json", action="store_true")
+     p.add_argument("--skip-vllm", action="store_true")
+     args = p.parse_args()
+ 
+@@ -188,10 +246,15 @@ def main() -> None:
+     if not Path(model).is_dir():
+         raise SystemExit(f"missing model: {model}")
+ 
+-    print(f"== v5 ({args.model}) ==")
++    num_prompts = args.num_prompts or max(args.concurrency, 1)
++    if args.prompt:
++        prompts = [args.prompt] * num_prompts
++    else:
++        prompts = _prompts(args.concurrency, num_prompts)
++
+     ours = _ours(
+         model,
+-        args.prompt,
++        prompts,
+         n=args.n,
+         warmup=args.warmup,
+         reps=args.reps,
+@@ -200,7 +263,11 @@ def main() -> None:
+         enable_ep=bool(args.ep),
+         moe_backend=args.moe_backend,
+     )
+-    print(json.dumps(ours, ensure_ascii=False))
++    if args.json:
++        print(json.dumps({"ours": ours}, ensure_ascii=False))
++    else:
++        print(f"== v5 ({args.model}, concurrency={len(prompts)}) ==")
++        print(json.dumps(ours, ensure_ascii=False))
+ 
+     if args.skip_vllm:
+         return
+@@ -212,17 +279,13 @@ def main() -> None:
+         )
+         return
+ 
+-    import os
+-
+     env = os.environ.copy()
+-    # Map selected devices into the child as cuda:0..
+     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in devices[: args.tp])
+     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+-    print(f"\n== official vLLM ({args.model}) via {vpy} ==")
+     theirs = _vllm(
+         vpy,
+         model,
+-        args.prompt,
++        prompts,
+         n=args.n,
+         warmup=args.warmup,
+         reps=args.reps,
+@@ -230,17 +293,22 @@ def main() -> None:
+         max_model_len=2048,
+         env=env,
+     )
+-    print(json.dumps(theirs, ensure_ascii=False))
+-    print("\n== ratio (v5 / vllm; >1 means v5 slower on that metric's inverse) ==")
+-    for k in ("ttft_ms", "decode_tok_s", "e2e_tok_s"):
++    if args.json:
++        print(json.dumps({"theirs": theirs}, ensure_ascii=False))
++    else:
++        print(f"\n== official vLLM ({args.model}) via {vpy} ==")
++        print(json.dumps(theirs, ensure_ascii=False))
++
++    lower_is_better = ("ttft_ms", "tpot_ms")
++    print("\n== ratio (v5 / vllm) ==")
++    for k in ("ttft_ms", "tpot_ms", "decode_tok_s", "throughput_tok_s"):
+         a, b = ours[k], theirs[k]
+-        if k.endswith("_s"):
+-            # throughput: higher better → ratio ours/theirs
+-            print(f"  {k}: v5={a:.2f} vllm={b:.2f}  v5/vllm={a / b:.3f}")
+-        else:
+-            # latency: lower better → ratio ours/theirs
+-            print(f"  {k}: v5={a:.2f} vllm={b:.2f}  v5/vllm={a / b:.3f}")
+-    print(f"  token_match={ours['tokens'] == theirs['tokens']}")
++        if b:
++            print(f"  {k}: v5={a:.3f} vllm={b:.3f}  v5/vllm={a / b:.3f}")
++    tok_same = ours["tokens"] == theirs["tokens"]
++    print(f"  token_match={tok_same}")
++    if not tok_same and len(ours["tokens"]) == 1:
++        print(f"    v5[0]={ours['tokens'][0][:16]}\n    vllm[0]={theirs['tokens'][0][:16]}")
+ 
+ 
+ if __name__ == "__main__":

@@ -1,0 +1,476 @@
+From bf0615076423c7ca4d2ae14d2986eb94ad63beec Mon Sep 17 00:00:00 2001
+From: lzp666d <lzp666d@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 15:07:39 +0800
+Subject: [PATCH 1/4] feat(v3): configurable chunked prefill with scheduling
+ coverage
+
+---
+ vllm-v3/config.yaml                  |  17 ++++
+ vllm-v3/run.py                       |  33 ++++++-
+ vllm-v3/src/config.py                |  17 ++++
+ vllm-v3/src/control/engine.py        |   4 +
+ vllm-v3/src/control/scheduler.py     |  96 ++++++++++++++++--
+ vllm-v3/test/common.py               |   4 +
+ vllm-v3/test/test_chunked_prefill.py | 139 +++++++++++++++++++++++++++
+ 7 files changed, 300 insertions(+), 10 deletions(-)
+ create mode 100644 vllm-v3/test/test_chunked_prefill.py
+
+diff --git a/vllm-v3/config.yaml b/vllm-v3/config.yaml
+index 9b06253..159cfe7 100644
+--- a/vllm-v3/config.yaml
++++ b/vllm-v3/config.yaml
+@@ -29,6 +29,23 @@ max_num_seqs: 256
+ max_num_batched_tokens: 8192
+ mix_prefill_decode: true
+ 
++# --- chunked prefill（参数语义对齐 vLLM SchedulerConfig）---
++# max_prefill_chunk: 单个 prefill chunk 的 token 上限（vLLM: long_prefill_token_threshold）
++#   0    = 不主动切分，chunk 只受 max_num_batched_tokens 约束（v3 原行为）
++#   1024 = 主动切片：按 context_len/4 取（4096/4），且是 kvcache_block_size(256) 的整数倍（页对齐）
++#   效果：长 prompt 跨多步算完，decode 每步都能插进来，ITL 更平稳
++max_prefill_chunk: 1024
++# 每步最多允许几个"未完成"prefill（vLLM: max_num_partial_prefills）
++max_num_partial_prefills: 1
++# 其中"长请求"（prompt > max_prefill_chunk）的未完成 prefill 上限（vLLM: max_long_partial_prefills）
++max_long_partial_prefills: 1
++
++# Sarathi 式"每步 prefill 总配额"：限制整步的 prefill 工作量（而非单个请求）。
++#   0    = 关闭（vLLM 模式：每请求 cap + 半截数量上限；步长无显式上界）
++#   2048 = 一步最多往 prefill 花 2048 token，并按"公平份额"分给本步的多个请求
++#          → 步长上界 = decode 数 + 2048（ITL 可控），且一步可推进多个长请求
++max_prefill_tokens_per_step: 2048
++
+ # --- KV Cache ---
+ kvcache_block_size: 256  # FA2 paged 要求 256 的倍数
+ prefix_backend: "hash"   # none / hash / radix
+diff --git a/vllm-v3/run.py b/vllm-v3/run.py
+index 71b9a06..3530ef8 100644
+--- a/vllm-v3/run.py
++++ b/vllm-v3/run.py
+@@ -50,6 +50,10 @@ DEFAULTS = {
+     "max_num_seqs": 256,
+     "max_num_batched_tokens": 8192,
+     "mix_prefill_decode": True,
++    "max_prefill_chunk": 1024,
++    "max_num_partial_prefills": 1,
++    "max_long_partial_prefills": 1,
++    "max_prefill_tokens_per_step": 2048,
+     "kvcache_block_size": 256,
+     "prefix_backend": "hash",
+     "gpu_memory_utilization": 0.9,
+@@ -72,6 +76,10 @@ def _make_engine(cfg: dict) -> Engine:
+             max_num_seqs=cfg["max_num_seqs"],
+             max_num_batched_tokens=cfg["max_num_batched_tokens"],
+             mix_prefill_decode=cfg["mix_prefill_decode"],
++            max_prefill_chunk=cfg["max_prefill_chunk"],
++            max_num_partial_prefills=cfg["max_num_partial_prefills"],
++            max_long_partial_prefills=cfg["max_long_partial_prefills"],
++            max_prefill_tokens_per_step=cfg["max_prefill_tokens_per_step"],
+             kvcache_block_size=cfg["kvcache_block_size"],
+             prefix_backend=cfg["prefix_backend"],
+             gpu_memory_utilization=cfg["gpu_memory_utilization"],
+@@ -209,6 +217,18 @@ def main() -> None:
+                    help="固定形状重放（仅离线固定长度；新长度会重编译）")
+     p.add_argument("--prefix-backend", choices=("none", "hash", "radix"), default=None)
+     p.add_argument("--max-num-seqs", type=int, default=None)
++    p.add_argument(
++        "--max-prefill-chunk",
++        type=int,
++        default=None,
++        help="chunked prefill 单个 chunk 的 token 上限；0=关闭切分（vLLM: long_prefill_token_threshold）",
++    )
++    p.add_argument(
++        "--max-prefill-tokens-per-step",
++        type=int,
++        default=None,
++        help="Sarathi 式每步 prefill 总配额；0=关闭（走 vLLM 模式）",
++    )
+     p.add_argument("--batch", action="store_true", help="运行批量推理演示")
+     p.add_argument("--download", action="store_true")
+     p.add_argument("--list", action="store_true")
+@@ -222,7 +242,18 @@ def main() -> None:
+     merge_cli(
+         cfg,
+         args,
+-        ("model", "prompt", "max_new_tokens", "temperature", "top_p", "top_k", "prefix_backend", "max_num_seqs"),
++        (
++            "model",
++            "prompt",
++            "max_new_tokens",
++            "temperature",
++            "top_p",
++            "top_k",
++            "prefix_backend",
++            "max_num_seqs",
++            "max_prefill_chunk",
++            "max_prefill_tokens_per_step",
++        ),
+     )
+     if args.cg:
+         cfg["enforce_eager"] = False
+diff --git a/vllm-v3/src/config.py b/vllm-v3/src/config.py
+index 396d6b3..b497aed 100644
+--- a/vllm-v3/src/config.py
++++ b/vllm-v3/src/config.py
+@@ -18,6 +18,15 @@ class EngineConfig:
+     max_num_seqs: int = 256
+     max_num_batched_tokens: int = 8192
+     mix_prefill_decode: bool = True  # True=decode优先混合调度，False=全prefill优先
++    # chunked prefill（参数语义对齐 vLLM SchedulerConfig）
++    # vLLM 对应: long_prefill_token_threshold / max_num_partial_prefills / max_long_partial_prefills
++    max_prefill_chunk: int = 0  # 单个 prefill chunk 的 token 上限；0=不切分（仅受 batch 预算约束）
++    max_num_partial_prefills: int = 1  # 每步最多允许几个未完成 prefill
++    max_long_partial_prefills: int = 1  # 其中长请求(prompt>max_prefill_chunk)的未完成 prefill 上限
++    # Sarathi 式"每步 prefill 总配额"（>0 启用）：本步所有 prefill chunk 的 token 之和上限。
++    # 与 max_prefill_chunk 的区别：后者限制"单个请求"，前者限制"整步的总工作量"。
++    # >0 时多个长请求可在同一步各推进一片，且不再受半截数量上限约束。
++    max_prefill_tokens_per_step: int = 0
+ 
+     #  内存 
+     kvcache_block_size: int = 256  # 必须是256的倍数（FA2 paged 约束）
+@@ -48,6 +57,14 @@ class EngineConfig:
+             raise ValueError(
+                 f"prefix_backend must be none|hash|radix, got {self.prefix_backend!r}"
+             )
++        if self.max_prefill_chunk < 0:
++            raise ValueError("max_prefill_chunk must be >= 0")
++        if self.max_num_partial_prefills <= 0:
++            raise ValueError("max_num_partial_prefills must be > 0")
++        if self.max_long_partial_prefills <= 0:
++            raise ValueError("max_long_partial_prefills must be > 0")
++        if self.max_prefill_tokens_per_step < 0:
++            raise ValueError("max_prefill_tokens_per_step must be >= 0")
+         self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
+         self.context_len = min(
+             self.context_len,
+diff --git a/vllm-v3/src/control/engine.py b/vllm-v3/src/control/engine.py
+index baa6e52..b5492f1 100644
+--- a/vllm-v3/src/control/engine.py
++++ b/vllm-v3/src/control/engine.py
+@@ -81,6 +81,10 @@ class Engine:
+             max_num_batched_tokens=self.config.max_num_batched_tokens,
+             eos_token_id=self.eos_token_id,
+             mix_prefill_decode=self.config.mix_prefill_decode,
++            max_prefill_chunk=self.config.max_prefill_chunk,
++            max_num_partial_prefills=self.config.max_num_partial_prefills,
++            max_long_partial_prefills=self.config.max_long_partial_prefills,
++            max_prefill_tokens_per_step=self.config.max_prefill_tokens_per_step,
+         )
+ 
+     def _init_kv(self) -> None:
+diff --git a/vllm-v3/src/control/scheduler.py b/vllm-v3/src/control/scheduler.py
+index aa96405..1ef7433 100644
+--- a/vllm-v3/src/control/scheduler.py
++++ b/vllm-v3/src/control/scheduler.py
+@@ -18,6 +18,10 @@ class Scheduler:
+         max_num_batched_tokens: int,
+         eos_token_id: int,
+         mix_prefill_decode: bool = True,
++        max_prefill_chunk: int = 0,
++        max_num_partial_prefills: int = 1,
++        max_long_partial_prefills: int = 1,
++        max_prefill_tokens_per_step: int = 0,
+     ) -> None:
+         # KV cache 管理器，负责块分配、释放、前缀匹配与回收。
+         self.kv = kv
+@@ -34,6 +38,22 @@ class Scheduler:
+         # 是否允许 prefill 与 decode 在同一步混合调度。
+         self.mix_prefill_decode = mix_prefill_decode
+ 
++        # chunked prefill：单个 chunk 的 token 上限（vLLM: long_prefill_token_threshold）。
++        # 0 = 不主动切分，chunk 只受 max_num_batched_tokens 约束（v3 原有行为）。
++        self.max_prefill_chunk = max_prefill_chunk
++
++        # 每步最多允许几个"未完成"的 prefill（vLLM: max_num_partial_prefills）。
++        self.max_num_partial_prefills = max_num_partial_prefills
++
++        # 其中"长请求"（prompt 长于 max_prefill_chunk）的未完成 prefill 上限
++        # （vLLM: max_long_partial_prefills）。
++        self.max_long_partial_prefills = max_long_partial_prefills
++
++        # Sarathi 式"每步 prefill 总配额"（0=关闭，走 vLLM 模式）。
++        # >0 时：本步所有 prefill chunk 的 token 之和不超过该值，多个请求共享这个额度，
++        # 于是"一步里多个长请求各推进一片"成为可能，而步长上界 = decode 数 + 该配额。
++        self.max_prefill_tokens_per_step = max_prefill_tokens_per_step
++
+         # 等待队列：新请求或被抢占后需要重新分配 KV 的序列。
+         self.waiting: deque[Sequence] = deque()
+ 
+@@ -122,6 +142,12 @@ class Scheduler:
+     ) -> int:
+         """从等待队列拉取 prefill chunk，直到序列预算或 token 预算耗尽。
+ 
++        chunked prefill 语义（对齐 vLLM SchedulerConfig）：
++          - 单个 chunk 不超过 max_prefill_chunk（vLLM: long_prefill_token_threshold，0=不限制）；
++          - 每步最多 max_num_partial_prefills 个"未完成"prefill（vLLM: max_num_partial_prefills）；
++          - 其中"长请求"的未完成 prefill 不超过 max_long_partial_prefills
++            （vLLM: max_long_partial_prefills）。
++
+         Args:
+             prefills: 输出参数，收集本步可调度的 prefill 序列。
+             decodes: 当前批次中已有的 decode 序列，用于判断序列预算。
+@@ -134,11 +160,21 @@ class Scheduler:
+         if not self.waiting or not self._room(prefills, decodes):
+             return tokens_used
+ 
+-        # 记录已产生的部分 prefill chunk 数量。
+-        # 每轮最多只允许一个序列处于未完成 prefill 状态，避免过多半截 prefill。
++        # 本步已产生的"未完成"prefill 数量，以及其中"长请求"的数量。
++        # 对齐 vLLM：用 max_num_partial_prefills / max_long_partial_prefills 限制并发半截 prefill，
++        # 避免太多没跑完的 prefill 占着 KV 页却不产出 token。
+         n_partial = 0
++        n_long_partial = 0
++
++        # Sarathi 模式：本步 prefill 总配额 + 已用量（>0 才启用）。
++        batch_cap = self.max_prefill_tokens_per_step
++        prefill_used = 0
++
++        # 快照 + 候选数：Sarathi 模式下用它算"公平份额"（剩余配额 / 还没轮到的请求数）。
++        waiting_snapshot = list(self.waiting)
++        n_candidates = max(1, len(waiting_snapshot))
+ 
+-        for seq in list(self.waiting):
++        for i, seq in enumerate(waiting_snapshot):
+             if not self._room(prefills, decodes):
+                 break
+ 
+@@ -163,24 +199,66 @@ class Scheduler:
+             if remaining < need and prefills and not allow_trailing_partial:
+                 break
+ 
+-            # 计算本步为该序列调度的 chunk 大小。
+-            chunk = min(need, remaining)
++            # 本步还能往 prefill 上花多少 token：
++            #   - 先受 batch token 预算 remaining 限制；
++            #   - Sarathi 模式下再受"每步 prefill 总配额"的剩余量限制，
++            #     并按"公平份额"把剩余配额分给还没轮到的请求：
++            #         share = max(一个物理页, 剩余配额 / 还没轮到的候选数)
++            #     这样一步之内多个长请求各推进一片，而不是队首把配额吃光；
++            #     下限取 block_size 是为了避免切出比一页还碎的 chunk。
++            if batch_cap > 0:
++                if prefill_used >= batch_cap:
++                    break
++                budget_left = batch_cap - prefill_used
++                n_rem = max(1, n_candidates - i)
++                share = max(self.kv.block_size, budget_left // n_rem)
++                allowed = min(remaining, budget_left, share)
++            else:
++                allowed = remaining
++
++            # 计算本步为该序列调度的 chunk 大小，逐层取最小：
++            #   1) need    —— 该序列本次还需要算的 token 数；
++            #   2) allowed —— 本步还能给 prefill 的额度（batch 预算 / 每步总配额）；
++            #   3) max_prefill_chunk —— 每请求 chunk 上限
++            #      （vLLM: long_prefill_token_threshold）：主动把长 prompt 切片，
++            #      让它跨多步算完，decode 每步都能插进来，ITL 更平稳。
++            chunk = min(need, allowed)
++            if self.max_prefill_chunk > 0:
++                chunk = min(chunk, self.max_prefill_chunk)
++
++            # 本步跑不完 → 产生一个"半截"chunk；prompt 本身超长 → 归为"长请求"。
++            is_partial = chunk < need
++            is_long = (
++                self.max_prefill_chunk > 0
++                and seq.num_prompt_tokens > self.max_prefill_chunk
++            )
++
++            # 只有 vLLM 模式（未启用每步总配额）才限制"半截"数量：
++            # 那时步长没有别的上界，只能靠限制半截请求数控制；
++            # Sarathi 模式下 batch_cap 已直接给出步长上界，无需再卡数量。
++            if is_partial and batch_cap == 0:
++                if n_partial >= self.max_num_partial_prefills:
++                    break
++                if is_long and n_long_partial >= self.max_long_partial_prefills:
++                    break
++
+             seq.num_scheduled_tokens = chunk
+             prefills.append(seq)
+             tokens_used += chunk
++            prefill_used += chunk
+ 
+             # 本步完成后 prompt 全部进入缓存：转入运行队列，本步需采样。
+-            if seq.num_cached_tokens + chunk == seq.num_tokens:
++            if not is_partial:
+                 seq.need_sample = True
+                 seq.status = SequenceStatus.RUNNING
+                 self.waiting.remove(seq)
+                 self.running.append(seq)
+             else:
+-                # 该序列本步只完成部分 prefill，仍留在等待队列中。
++                # 该序列本步只完成部分 prefill，仍留在等待队列中（FIFO，下一轮继续切片）。
+                 seq.need_sample = False
+                 n_partial += 1
+-                if n_partial >= 1:
+-                    break
++                if is_long:
++                    n_long_partial += 1
+ 
+         return tokens_used
+ 
+diff --git a/vllm-v3/test/common.py b/vllm-v3/test/common.py
+index ef12d9e..12b0330 100644
+--- a/vllm-v3/test/common.py
++++ b/vllm-v3/test/common.py
+@@ -35,6 +35,8 @@ def make_engine(
+     max_batched: int = 8192,
+     gpu_mem: float = 0.85,
+     context_len: int = 4096,
++    max_prefill_chunk: int = 0,
++    max_prefill_tokens_per_step: int = 0,
+ ) -> Engine:
+     return Engine(
+         EngineConfig(
+@@ -47,6 +49,8 @@ def make_engine(
+             max_num_seqs=max_num_seqs,
+             max_num_batched_tokens=max_batched,
+             mix_prefill_decode=mix,
++            max_prefill_chunk=max_prefill_chunk,
++            max_prefill_tokens_per_step=max_prefill_tokens_per_step,
+             kvcache_block_size=256,
+             prefix_backend=prefix,
+             gpu_memory_utilization=gpu_mem,
+diff --git a/vllm-v3/test/test_chunked_prefill.py b/vllm-v3/test/test_chunked_prefill.py
+new file mode 100644
+index 0000000..f06d912
+--- /dev/null
++++ b/vllm-v3/test/test_chunked_prefill.py
+@@ -0,0 +1,139 @@
++"""chunked prefill 行为验证（对齐 vLLM SchedulerConfig 语义）。
++
++验证 max_prefill_chunk（vLLM: long_prefill_token_threshold）：
++  1. =0 时不主动切分：prompt=3000 一步 prefill 完成，无"半截"步；
++  2. =1024 时主动切片：3000 跨 3 个 chunk（2 次半截 + 1 次收尾）；
++  3. 切分期间 decode 仍每步推进（混合批处理未被破坏）；
++  4. max_num_partial_prefills=1：同一步最多一个未完成 prefill。
++
++用法:
++    python test/test_chunked_prefill.py
++"""
++from __future__ import annotations
++
++import math
++import sys
++from pathlib import Path
++
++import torch
++
++ROOT = Path(__file__).resolve().parent.parent
++if str(ROOT) not in sys.path:
++    sys.path.insert(0, str(ROOT))
++
++from common import destroy, dummy_ids, make_engine, warmup  # noqa: E402
++from src import SamplingParams  # noqa: E402
++
++PROMPT_LEN = 3000
++CHUNK = 1024
++
++
++def _check(cond: bool, msg: str) -> None:
++    if not cond:
++        raise AssertionError(msg)
++
++
++def _run(chunk: int, n_long: int = 1, batch_cap: int = 0):
++    """返回 (半截 prefill 步数, 单步并发半截峰值, prefill 窗口内短请求产出 token 数, ...)。"""
++    engine = make_engine(
++        cg=False, compile=False, prefix="none", mix=True,
++        max_num_seqs=8, max_batched=8192, gpu_mem=0.85,
++        max_prefill_chunk=chunk,
++        max_prefill_tokens_per_step=batch_cap,
++    )
++    try:
++        warmup(engine, 8)
++        sp_short = SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True)
++        sp_long = SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True)
++        shorts = [engine.add_request(dummy_ids(128, salt=i), sp_short) for i in range(4)]
++        longs = [
++            engine.add_request(dummy_ids(PROMPT_LEN, salt=9 + j), sp_long)
++            for j in range(n_long)
++        ]
++
++        partial_steps = 0
++        max_concurrent_partial = 0
++        decode_in_window = 0
++        prev_short = [s.num_completion_tokens for s in shorts]
++        prev_cached = [s.num_cached_tokens for s in longs]
++
++        while not engine.scheduler.is_finished():
++            engine.step()
++            # 本步"推进了但没跑完"的长请求 = 半截 prefill
++            n_now = sum(
++                1
++                for s, pc in zip(longs, prev_cached)
++                if s.num_cached_tokens > pc and s.num_cached_tokens < s.num_prompt_tokens
++            )
++            if n_now:
++                partial_steps += 1
++                max_concurrent_partial = max(max_concurrent_partial, n_now)
++            # 长请求尚未 prefill 完的窗口里，短请求产出了多少 token
++            if any(s.num_cached_tokens < s.num_prompt_tokens for s in longs):
++                decode_in_window += sum(
++                    s.num_completion_tokens - p for s, p in zip(shorts, prev_short)
++                )
++            prev_short = [s.num_completion_tokens for s in shorts]
++            prev_cached = [s.num_cached_tokens for s in longs]
++
++        return partial_steps, max_concurrent_partial, decode_in_window, shorts, longs
++    finally:
++        destroy(engine)
++
++
++def check_chunk_off() -> None:
++    steps, _, _, shorts, longs = _run(0)
++    _check(steps == 0, f"chunk=0 不应出现半截 prefill，实际 {steps} 步")
++    _check(all(s.num_completion_tokens == 8 for s in shorts), "短请求未全部完成")
++    _check(all(s.num_completion_tokens == 4 for s in longs), "长请求未完成")
++
++
++def check_chunk_on() -> None:
++    steps, _, decode_in_window, shorts, longs = _run(CHUNK)
++    expect = math.ceil(PROMPT_LEN / CHUNK) - 1  # 3 个 chunk -> 2 次半截
++    _check(steps == expect, f"chunk={CHUNK} 期望 {expect} 次半截 prefill，实际 {steps}")
++    _check(decode_in_window > 0, "切分期间 decode 未推进（混合调度失效）")
++    _check(all(s.num_completion_tokens == 8 for s in shorts), "短请求未全部完成")
++    _check(all(s.num_completion_tokens == 4 for s in longs), "长请求未完成")
++
++
++def check_partial_limit() -> None:
++    _, conc, _, shorts, longs = _run(CHUNK, n_long=2)
++    _check(conc <= 1, f"max_num_partial_prefills=1，但出现 {conc} 个并发半截 prefill")
++    _check(all(s.num_completion_tokens == 8 for s in shorts), "短请求未全部完成")
++    _check(all(s.num_completion_tokens == 4 for s in longs), "长请求未完成")
++
++
++def check_sarathi_fair_share() -> None:
++    """Sarathi 模式（每步 prefill 总配额 + 公平份额）：一步内多个长请求各推进一片。"""
++    _, conc, decode_in_window, shorts, longs = _run(CHUNK, n_long=4, batch_cap=2048)
++    _check(conc >= 2, f"每步配额模式下一步应推进多个长请求，实际并发峰值 {conc}")
++    _check(decode_in_window > 0, "切分期间 decode 未推进")
++    _check(all(s.num_completion_tokens == 8 for s in shorts), "短请求未全部完成")
++    _check(all(s.num_completion_tokens == 4 for s in longs), "长请求未完成")
++
++
++def main() -> None:
++    torch.cuda.set_device("cuda:0")
++    cases = [
++        ("chunk_off_no_partial", check_chunk_off),
++        ("chunk_on_1024_three_chunks", check_chunk_on),
++        ("max_num_partial_prefills_1", check_partial_limit),
++        ("sarathi_fair_share_multi", check_sarathi_fair_share),
++    ]
++    failed = 0
++    for name, fn in cases:
++        try:
++            fn()
++            print(f"PASS  {name}")
++        except Exception as e:  # noqa: BLE001
++            failed += 1
++            print(f"FAIL  {name}: {e}")
++
++    if failed:
++        raise SystemExit(1)
++    print("OK")
++
++
++if __name__ == "__main__":
++    main()
